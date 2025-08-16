@@ -1,28 +1,26 @@
 
 # hotfix_ma.py
-# Safely compute moving averages when yfinance returns non-1D "Close" data.
+# Helpers to robustly handle yfinance Close objects and moving averages.
 
 import pandas as pd
 import numpy as np
 
 def to_series_close(close_like):
-    """Always return a 1-D Series from a Close-like object (Series/DataFrame/MultiIndex)."""
+    """Return a 1-D Series from a Close-like object (Series/DataFrame/MultiIndex/array)."""
     if isinstance(close_like, pd.Series):
         return close_like
     if isinstance(close_like, pd.DataFrame):
-        # If MultiIndex columns, try the first numeric leaf
         try:
             if isinstance(close_like.columns, pd.MultiIndex):
+                # walk the first numeric leaf
                 for col in close_like.columns:
                     s = close_like[col]
                     if isinstance(s, pd.Series):
                         return s
                     if isinstance(s, pd.DataFrame) and s.shape[1] == 1:
                         return s.iloc[:, 0]
-            # Single column DF
             if close_like.shape[1] == 1:
                 return close_like.iloc[:, 0]
-            # Fallback: first numeric column
             for c in close_like.columns:
                 if pd.api.types.is_numeric_dtype(close_like[c]):
                     return close_like[c]
