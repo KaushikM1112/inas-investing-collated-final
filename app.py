@@ -1,12 +1,15 @@
 
-import os, io, json, time, math, functools, typing as t
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+import os, io, json, math
+from datetime import datetime
+import typing as t
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+
+# Use forgiving MA helper
+from hotfix_ma import moving_average_forgiving
 
 try:
     import yfinance as yf
@@ -20,8 +23,8 @@ try:
 except Exception:
     GSPREAD_OK = False
 
-st.set_page_config(page_title="Investment – Collated Final", layout="wide")
-st.title("📈 Investment Dashboard – Collated Final (with Greedy Planner)")
+st.set_page_config(page_title="Investment – Collated Final (MA Hotfix)", layout="wide")
+st.title("📈 Investment Dashboard – Collated Final (with MA Hotfix)")
 
 DEFAULT_BASE_CURRENCY = "AUD"
 FX_TICKER_AUDUSD = "AUDUSD=X"
@@ -45,19 +48,16 @@ def safe_yf_download(ticker, period="1d", interval="1d"):
     except Exception:
         return None
 
-def get_last_price(ticker: str):
+def get_last_price(ticker: str) -> t.Tuple[float, str]:
     df = safe_yf_download(ticker, period="5d", interval="1d")
     if df is None or df.empty:
-        return (float('nan'), "no-data")
-    p = float(df["Close"].dropna().iloc[-1])
+        return (float("nan"), "no-data")
+    p = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    if p.empty:
+        return (float("nan"), "no-data")
+    last = float(p.iloc[-1])
     ts = df.index[-1].to_pydatetime()
-    return (p, ts.strftime("%Y-%m-%d %H:%M UTC"))
-
-def moving_average(series: pd.Series, window: int = 20) -> float:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) < window:
-        return float(s.mean()) if len(s) else float('nan')
-    return float(s.tail(window).mean())
+    return (last, ts.strftime("%Y-%m-%d %H:%M UTC"))
 
 def drift_adjust(price: float, hours_since: float, drift_bps_per_hour: float = 2.0) -> float:
     if not np.isfinite(price) or not np.isfinite(hours_since):
@@ -145,6 +145,7 @@ def write_to_sheet(data: dict):
     except Exception:
         return False
 
+# --- Sidebar ---
 st.sidebar.header("Data Source")
 use_sheets = st.sidebar.checkbox("Use Google Sheets (if configured in secrets)", value=False)
 if st.sidebar.button("Load Holdings"):
@@ -162,6 +163,7 @@ if st.sidebar.button("Save Holdings"):
         ok = write_to_sheet(data) if use_sheets else save_local_json(data)
         st.success("Saved." if ok else "Save failed.")
 
+# --- Data model ---
 holdings = st.session_state.get("holdings", load_local_json())
 
 st.subheader("🎯 Targets & Positions")
@@ -183,17 +185,11 @@ holdings["targets"] = new_targets
 holdings["positions"] = new_positions
 st.session_state["holdings"] = holdings
 
+# --- Live pricing & FX ---
 st.subheader("💹 Live Prices & Valuation")
-try:
-    FX_TICKER_AUDUSD = "AUDUSD=X"
-    GOLD_TICKER_USD = "GC=F"
-    BTC_TICKER_USD = "BTC-USD"
-    fx_price, fx_ts = get_last_price(FX_TICKER_AUDUSD)
-    gold_usd, gold_ts = get_last_price(GOLD_TICKER_USD)
-    btc_usd, btc_ts = get_last_price(BTC_TICKER_USD)
-except Exception:
-    fx_price, fx_ts, gold_usd, gold_ts, btc_usd, btc_ts = float('nan'), "no-data", float('nan'), "no-data", float('nan'), "no-data"
-
+fx_price, fx_ts = get_last_price(FX_TICKER_AUDUSD)
+gold_usd, gold_ts = get_last_price(GOLD_TICKER_USD)
+btc_usd, btc_ts = get_last_price(BTC_TICKER_USD)
 col_fx, col_opts = st.columns([3,2])
 with col_fx:
     st.write(f"**AUDUSD** last: {fx_price if np.isfinite(fx_price) else 'n/a'} @ {fx_ts}")
@@ -210,21 +206,21 @@ with col_opts:
 
 tickers = [p["ticker"] for p in new_positions if str(p.get("ticker","")).strip()]
 unique_tickers = sorted(set([t for t in tickers if t]))
-prices = {}
-timestamps = {}
+
+prices, timestamps = {}, {}
 for tck in unique_tickers:
-    p, ts = get_last_price(tck)
-    if drift_on and isinstance(ts, str) and "UTC" in ts:
+    px, ts = get_last_price(tck)
+    # Optional drift adjust (if timestamp parseable)
+    if drift_on and isinstance(ts, str) and "UTC" in ts and np.isfinite(px):
         try:
-            from datetime import datetime as dt
-            ts_dt = dt.strptime(ts.replace(" UTC",""), "%Y-%m-%d %H:%M")
-            hours = (dt.utcnow() - ts_dt).total_seconds()/3600.0
-            p = drift_adjust(p, hours, drift_bps_per_hour)
+            ts_dt = datetime.strptime(ts.replace(" UTC",""), "%Y-%m-%d %H:%M")
+            hours = (datetime.utcnow() - ts_dt).total_seconds()/3600.0
+            px = drift_adjust(px, hours, drift_bps_per_hour)
         except Exception:
             pass
-    prices[tck] = p
-    timestamps[tck] = ts
+    prices[tck], timestamps[tck] = px, ts
 
+# Valuation table
 rows = []
 for p in new_positions:
     tck = p.get("ticker","").strip()
@@ -241,6 +237,7 @@ total_mv = float(val_df["MarketValue"].sum()) if not val_df.empty else 0.0
 st.dataframe(val_df.fillna("n/a"), use_container_width=True)
 st.metric("Portfolio Market Value", fmt_money(total_mv))
 
+# Allocation
 st.subheader("🧭 Allocation")
 if not val_df.empty:
     alloc = val_df.groupby("Ticker")["MarketValue"].sum()
@@ -252,6 +249,7 @@ if not val_df.empty:
     ax.set_title("Portfolio Allocation")
     st.pyplot(fig)
 
+# Rebalance
 st.subheader("🔧 Rebalance Advisor")
 tgt_series = pd.Series(new_targets, dtype=float)
 cur_series = alloc_pct if 'alloc_pct' in locals() else pd.Series(dtype=float)
@@ -259,19 +257,21 @@ combined = pd.DataFrame({"Target %": tgt_series, "Current %": cur_series}).filln
 combined["Diff %"] = combined["Target %"] - combined["Current %"]
 st.dataframe(combined.sort_values("Diff %", ascending=True), use_container_width=True)
 
+# Greedy Planner
 st.subheader("🧮 Greedy Planner (fees, slippage, lot sizes, FX)")
 cash_aud = st.number_input("Available cash (AUD)", 0.0, 1e9, 10000.0, step=100.0)
 lot_size = st.number_input("Lot size (min units per trade)", 1, 10000, 1, step=1)
 if st.button("Plan Buys"):
-    import math
     desired_weights = combined["Target %"] / combined["Target %"].sum()
     desired_values = desired_weights * (total_mv + cash_aud)
     current_values = (cur_series / 100.0) * total_mv
     gap = (desired_values - current_values).fillna(0.0)
+
     plan = []
     prices_vec = {t: prices.get(t, float('nan')) for t in desired_weights.index}
     fees = fee_bps / 10000.0
     slip = slippage_bps / 10000.0
+
     remaining_cash = cash_aud
     safety = 20000
     while remaining_cash > 0 and safety > 0:
@@ -292,6 +292,7 @@ if st.button("Plan Buys"):
         remaining_cash -= spend
         gap[tgt] -= spend
         plan.append({"Ticker": tgt, "Qty": qty, "EstPrice": px, "EstSpend": spend})
+
     plan_df = pd.DataFrame(plan)
     if plan_df.empty:
         st.info("No feasible buys with current cash/lot size/fees.")
@@ -301,21 +302,27 @@ if st.button("Plan Buys"):
         csv_buf = io.StringIO(); plan_df.to_csv(csv_buf, index=False)
         st.download_button("⬇️ Download plan CSV", data=csv_buf.getvalue(), file_name="buy_plan.csv", mime="text/csv")
 
+# Alerts (uses forgiving MA)
 st.subheader("🚨 Alerts")
 alert_rows = []
 ma_window = st.number_input("MA window (days)", 5, 200, 20)
-for tck in sorted(set([p.get("ticker","") for p in new_positions if p.get("ticker","")])):
+for tck in unique_tickers:
     df = safe_yf_download(tck, period="90d", interval="1d")
     if df is None or df.empty:
         continue
-    last = float(df["Close"].dropna().iloc[-1])
-    ma = moving_average(df["Close"], ma_window)
+    last_close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    if last_close.empty:
+        continue
+    last = float(last_close.iloc[-1])
+    ma = moving_average_forgiving(df["Close"], ma_window)  # <- hotfix in action
     cur_w = float(alloc_pct.get(tck, 0.0)) if 'alloc_pct' in locals() else 0.0
     tgt_w = new_targets.get(tck, 0.0)
-    alert_rows.append({"Ticker": tck, "Last": last, f"MA{ma_window}": ma, "AboveMA": last>ma if np.isfinite(ma) else None, "AllocDrift %": cur_w - tgt_w})
+    alert_rows.append({"Ticker": tck, "Last": last, f"MA{ma_window}": ma, "AboveMA": (last>ma) if np.isfinite(ma) else None, "AllocDrift %": cur_w - tgt_w})
+
 if alert_rows:
     st.dataframe(pd.DataFrame(alert_rows), use_container_width=True)
 
+# Import/Export
 st.subheader("🗂️ Import / Export")
 cE1, cE2 = st.columns(2)
 with cE1:
